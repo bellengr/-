@@ -30,13 +30,13 @@ except ImportError as e:
 # ====================== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ======================
 GROUP_TOKEN = os.getenv('GROUP_TOKEN', '')
 USER_TOKEN = os.getenv('USER_TOKEN', '')
-GROUP_ID = int(os.getenv('GROUP_ID', '241663340'))  # ← ID группы бота комментариев
-CONFIRMATION_CODE = os.getenv('CONFIRMATION_CODE', '5a3fed15')  # ← Код подтверждения
+GROUP_ID = int(os.getenv('GROUP_ID', '241663340'))
+CONFIRMATION_CODE = os.getenv('CONFIRMATION_CODE', '5a3fed15')
 PORT = int(os.getenv('PORT', '3000'))
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '447457340')
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(',') if x.strip()]
-DELETE_AFTER = 300  # 5 минут
-MIN_COMMENT_LENGTH = 10  # Минимальная длина комментария
+DELETE_AFTER = 300
+MIN_COMMENT_LENGTH = 10
 # =============================================================================
 
 MAX_QUEUE_SIZE = 5
@@ -54,7 +54,6 @@ vk_user = None
 user_activity = {}
 activity_lock = threading.Lock()
 
-# Кэш имён пользователей
 user_name_cache = {}
 user_name_cache_lock = threading.Lock()
 USER_NAME_CACHE_TTL = 3600
@@ -342,17 +341,11 @@ def rate_limit():
 # ====================== ПАРСИНГ ССЫЛОК ======================
 
 def parse_content_link(text: str) -> Optional[tuple]:
-    """
-    Парсит ссылку на контент.
-    Возвращает (content_type, owner_id, item_id) или None.
-    content_type: 'post' / 'photo' / 'video'
-    """
     if not text:
         return None
     
     text = text.strip()
     
-    # Пост
     match = re.search(r'(wall-?\d+_\d+)', text)
     if match:
         parts = match.group(1).split('_')
@@ -360,7 +353,6 @@ def parse_content_link(text: str) -> Optional[tuple]:
         item_id = int(parts[1])
         return 'post', owner_id, item_id
     
-    # Фото
     match = re.search(r'(photo-?\d+_\d+)', text)
     if match:
         parts = match.group(1).split('_')
@@ -368,7 +360,6 @@ def parse_content_link(text: str) -> Optional[tuple]:
         item_id = int(parts[1])
         return 'photo', owner_id, item_id
     
-    # Видео
     match = re.search(r'(video-?\d+_\d+)', text)
     if match:
         parts = match.group(1).split('_')
@@ -376,7 +367,6 @@ def parse_content_link(text: str) -> Optional[tuple]:
         item_id = int(parts[1])
         return 'video', owner_id, item_id
     
-    # Клип
     match = re.search(r'(clip-?\d+_\d+)', text)
     if match:
         parts = match.group(1).split('_')
@@ -388,7 +378,6 @@ def parse_content_link(text: str) -> Optional[tuple]:
 
 
 def extract_vk_link(text: str) -> Optional[str]:
-    """Извлекает ссылку из текста"""
     if not text:
         return None
     patterns = [
@@ -409,17 +398,18 @@ def extract_vk_link(text: str) -> Optional[str]:
 def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tuple:
     """
     Проверяет, открыты ли комментарии у контента.
+    Использует пользовательский токен (vk_user).
     Возвращает: (можно_комментировать, причина)
     """
-    global vk_group
-    if vk_group is None:
+    global vk_user
+    if vk_user is None:
         return False, "Бот не подключен"
     
     try:
         rate_limit()
         
         if content_type == 'post':
-            response = vk_group.wall.getById(
+            response = vk_user.wall.getById(
                 posts=f"{owner_id}_{item_id}",
                 extended=0
             )
@@ -429,6 +419,11 @@ def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tu
             
             post = items[0]
             comments_info = post.get('comments', {})
+            
+            # Если поля can_post нет — считаем открытыми
+            if 'can_post' not in comments_info:
+                return True, ""
+            
             can_post = comments_info.get('can_post', 0)
             
             if can_post == 0:
@@ -436,7 +431,7 @@ def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tu
             return True, ""
             
         elif content_type == 'photo':
-            response = vk_group.photos.getById(
+            response = vk_user.photos.getById(
                 photos=f"{owner_id}_{item_id}",
                 extended=1
             )
@@ -446,6 +441,10 @@ def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tu
                 return False, "Фото не найдено"
             
             photo = items[0]
+            
+            if 'can_comment' not in photo:
+                return True, ""
+            
             can_comment = photo.get('can_comment', 0)
             
             if can_comment == 0:
@@ -453,7 +452,7 @@ def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tu
             return True, ""
             
         elif content_type == 'video':
-            response = vk_group.video.get(
+            response = vk_user.video.get(
                 videos=f"{owner_id}_{item_id}",
                 extended=1
             )
@@ -463,6 +462,10 @@ def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tu
                 return False, "Видео не найдено"
             
             video = items[0]
+            
+            if 'can_comment' not in video:
+                return True, ""
+            
             can_comment = video.get('can_comment', 0)
             
             if can_comment == 0:
@@ -473,21 +476,17 @@ def can_comment_on_content(content_type: str, owner_id: int, item_id: int) -> tu
         
     except ApiError as e:
         error_msg = str(e)
-        if 'Access denied' in error_msg or '15' in error_msg:
-            return False, "Нет доступа к контенту"
-        return False, f"Ошибка проверки: {error_msg}"
+        print(f"   ⚠️ can_comment_on_content ошибка: {error_msg}", flush=True)
+        # Не смогли проверить — пропускаем
+        return True, ""
     except Exception as e:
-        return False, f"Ошибка проверки: {e}"
+        print(f"   ⚠️ can_comment_on_content ошибка: {e}", flush=True)
+        return True, ""
 
 
 # ====================== ПРОВЕРКА КОММЕНТАРИЕВ ======================
 
 def is_quality_comment(text: str) -> tuple:
-    """
-    Проверяет качество комментария.
-    Возвращает: (статус, причина)
-      статус: 'ok' / 'bad'
-    """
     if not text:
         return 'bad', "Комментарий пустой или содержит только стикер/смайлик"
     
@@ -511,14 +510,18 @@ def is_quality_comment(text: str) -> tuple:
 
 
 def find_comment_in_post(owner_id: int, post_id: int, user_id: int) -> Optional[dict]:
-    """Ищет комментарий пользователя под постом (только корневые)"""
+    """Ищет комментарий под постом через пользовательский токен"""
+    global vk_user
+    if vk_user is None:
+        return None
+    
     offset = 0
     count = 100
     
     while True:
         try:
             rate_limit()
-            response = vk_group.wall.getComments(
+            response = vk_user.wall.getComments(
                 owner_id=owner_id,
                 post_id=post_id,
                 count=count,
@@ -549,14 +552,18 @@ def find_comment_in_post(owner_id: int, post_id: int, user_id: int) -> Optional[
 
 
 def find_comment_in_photo(owner_id: int, photo_id: int, user_id: int) -> Optional[dict]:
-    """Ищет комментарий пользователя под фото"""
+    """Ищет комментарий под фото через пользовательский токен"""
+    global vk_user
+    if vk_user is None:
+        return None
+    
     offset = 0
     count = 100
     
     while True:
         try:
             rate_limit()
-            response = vk_group.photos.getComments(
+            response = vk_user.photos.getComments(
                 owner_id=owner_id,
                 photo_id=photo_id,
                 count=count,
@@ -586,14 +593,18 @@ def find_comment_in_photo(owner_id: int, photo_id: int, user_id: int) -> Optiona
 
 
 def find_comment_in_video(owner_id: int, video_id: int, user_id: int) -> Optional[dict]:
-    """Ищет комментарий пользователя под видео/клипом"""
+    """Ищет комментарий под видео через пользовательский токен"""
+    global vk_user
+    if vk_user is None:
+        return None
+    
     offset = 0
     count = 100
     
     while True:
         try:
             rate_limit()
-            response = vk_group.video.getComments(
+            response = vk_user.video.getComments(
                 owner_id=owner_id,
                 video_id=video_id,
                 count=count,
@@ -623,10 +634,6 @@ def find_comment_in_video(owner_id: int, video_id: int, user_id: int) -> Optiona
 
 
 def check_user_comment(content_type: str, owner_id: int, item_id: int, user_id: int) -> tuple:
-    """
-    Проверяет комментарий пользователя.
-    Возвращает: (статус, причина)
-    """
     try:
         comment = None
         
@@ -845,7 +852,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
     
     cleanup_expired_vip()
     
-    # ===== КОМАНДА !vip =====
     if text_lower.startswith('!vip '):
         try:
             vk_link = extract_vk_link(text.split()[1])
@@ -871,7 +877,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, "⚠️ Не удалось распознать ссылку!")
         return True
     
-    # ===== КОМАНДА !delvip =====
     if text_lower.startswith('!delvip'):
         parts = text.split()
         if len(parts) >= 2:
@@ -893,7 +898,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, "⚠️ Использование: !delvip [ссылка]")
         return True
     
-    # ===== КОМАНДА !vip_list =====
     if text_lower == '!vip_list':
         with vip_links_lock:
             if not vip_links:
@@ -908,13 +912,11 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, result)
         return True
     
-    # ===== КОМАНДА !inactive =====
     if text_lower == '!inactive':
         inactive_text = get_inactive_users(peer_id)
         send_message(peer_id, inactive_text)
         return True
     
-    # ===== КОМАНДА !delqueue =====
     if text_lower.startswith('!delqueue'):
         parts = text.split()
         if len(parts) >= 2:
@@ -947,7 +949,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, "⚠️ Использование: !delqueue [ссылка]")
         return True
     
-    # ===== КОМАНДА !clearqueue =====
     if text_lower == '!clearqueue':
         with queue_lock:
             count = len(queue)
@@ -957,7 +958,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
         send_message(peer_id, f"✅ Очередь полностью очищена! (удалено {count} ссылок)")
         return True
     
-    # ===== КОМАНДА !queue_list =====
     if text_lower == '!queue_list':
         with queue_lock:
             if not queue:
@@ -980,7 +980,6 @@ def can_user_post(user_id: int) -> bool:
         user_posts = [i for i, item in enumerate(queue) if item['user_id'] == user_id]
         if not user_posts:
             return True
-        # Правило: 5 чужих ссылок между своими
         return len(queue) - user_posts[-1] - 1 >= 5
 
 
@@ -1013,7 +1012,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
     
     mention = get_mention(user_id)
     
-    # === ПУБЛИКАЦИЯ ССЫЛКИ АДМИНИСТРАТОРОМ ===
     if is_owner(user_id):
         parsed = parse_content_link(text)
         if parsed:
@@ -1035,7 +1033,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         else:
             return
     
-    # === ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ ===
     vk_link = extract_vk_link(text)
     
     if not vk_link:
@@ -1044,7 +1041,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, f"{mention}, 🔗 сообщение должно содержать только ссылку на контент!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
     
-    # Проверяем, что сообщение содержит ТОЛЬКО ссылку
     text_without_link = text
     text_without_link = re.sub(r'https?://(m\.)?vk\.(com|ru)/' + re.escape(vk_link) + r'(\?[^\s]*)?', '', text_without_link)
     text_without_link = re.sub(r'(m\.)?vk\.(com|ru)/' + re.escape(vk_link) + r'(\?[^\s]*)?', '', text_without_link)
@@ -1057,7 +1053,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, f"{mention}, 🔗 сообщение должно содержать ТОЛЬКО ссылку на контент!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
     
-    # ===== ПРОВЕРКА ОТКРЫТОСТИ КОММЕНТАРИЕВ =====
     parsed = parse_content_link(vk_link)
     if not parsed:
         if message_id:
@@ -1074,7 +1069,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, f"{mention}, ⚠️ невозможно проверить комментарии!\n\n📌 {reason}\n\n💡 Публикуем только контент с ОТКРЫТЫМИ комментариями.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
     
-    # Проверяем очередь
     if not can_user_post(user_id):
         need = max(0, 5 - get_posts_after_user(user_id))
         if message_id:
@@ -1082,7 +1076,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, f"{mention}, ⏳ ждем Вас через {need} ссылок!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
     
-    # ===== ПРОВЕРКА VIP ССЫЛОК =====
     cleanup_expired_vip()
     
     missing_vip = []
@@ -1114,7 +1107,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, text)
         return
     
-    # ===== ПРОВЕРКА ОБЫЧНЫХ ССЫЛОК =====
     with queue_lock:
         regular_links = [item for item in queue[-5:]]
     
@@ -1146,8 +1138,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
             send_message(peer_id, text)
             return
-    
-    # ========== ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - ПУБЛИКУЕМ ==========
     
     with queue_lock:
         queue.append({
