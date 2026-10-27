@@ -31,7 +31,7 @@ except ImportError as e:
 GROUP_TOKEN = os.getenv('GROUP_TOKEN', '')
 USER_TOKEN = os.getenv('USER_TOKEN', '')
 GROUP_ID = int(os.getenv('GROUP_ID', '241663340'))
-CONFIRMATION_CODE = os.getenv('CONFIRMATION_CODE', '5a3fed15')
+CONFIRMATION_CODE = os.getenv('CONFIRMATION_CODE', '9825f377')
 PORT = int(os.getenv('PORT', '3000'))
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '447457340')
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(',') if x.strip()]
@@ -40,7 +40,12 @@ MIN_COMMENT_LENGTH = 10
 # =============================================================================
 
 MAX_QUEUE_SIZE = 5
-VIP_DURATION_HOURS = 24
+VIP_DURATIONS = {
+    '24': 24,
+    '48': 48,
+    '72': 72,
+}
+DEFAULT_VIP_DURATION = 24
 RATE_LIMIT_DELAY = 0.5
 DB_FILE = "comments_bot.db"
 
@@ -50,9 +55,6 @@ vip_links = []
 vip_links_lock = threading.Lock()
 vk_group = None
 vk_user = None
-
-user_activity = {}
-activity_lock = threading.Lock()
 
 user_name_cache = {}
 user_name_cache_lock = threading.Lock()
@@ -132,13 +134,6 @@ def init_database():
             )
         ''')
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_activity (
-                user_id INTEGER PRIMARY KEY,
-                last_post_time TEXT,
-                post_count INTEGER DEFAULT 0
-            )
-        ''')
-        cursor.execute('''
             CREATE TABLE IF NOT EXISTS bot_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 peer_id INTEGER NOT NULL,
@@ -155,7 +150,7 @@ def init_database():
 
 
 def load_data():
-    global queue, vip_links, user_activity, pending_deletions
+    global queue, vip_links, pending_deletions
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -181,13 +176,6 @@ def load_data():
                     'added_by': row[1],
                     'expires_at': expires_at
                 })
-
-        cursor.execute('SELECT user_id, last_post_time, post_count FROM user_activity')
-        for row in cursor.fetchall():
-            user_activity[row[0]] = {
-                'last_post_time': datetime.fromisoformat(row[1]) if row[1] else None,
-                'post_count': row[2]
-            }
 
         cursor.execute('SELECT peer_id, conv_message_id, created_at FROM bot_messages')
         for row in cursor.fetchall():
@@ -225,23 +213,6 @@ def remove_bot_message(conv_message_id: int):
         conn.close()
     except Exception as e:
         print(f"⚠️ Ошибка удаления из БД: {e}")
-
-
-def save_user_activity(user_id: int):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO user_activity (user_id, last_post_time, post_count)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                last_post_time = excluded.last_post_time,
-                post_count = excluded.post_count
-        ''', (user_id, datetime.now().isoformat(), user_activity.get(user_id, {}).get('post_count', 0) + 1))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"⚠️ Ошибка сохранения активности: {e}")
 
 
 def save_queue():
@@ -803,37 +774,6 @@ def cleanup_worker():
             time.sleep(5)
 
 
-def get_inactive_users(peer_id: int) -> str:
-    global user_activity
-    now = datetime.now()
-    inactive = []
-    
-    with activity_lock:
-        for user_id, data in user_activity.items():
-            if data.get('last_post_time'):
-                last_post = data['last_post_time']
-                days_inactive = (now - last_post).days
-                if days_inactive > 10:
-                    inactive.append((user_id, days_inactive))
-            else:
-                inactive.append((user_id, 999))
-    
-    if not inactive:
-        return "✅ Все участники активны!"
-    
-    text = "📋 Неактивные участники (более 10 дней без публикаций):\n\n"
-    for user_id, days in inactive:
-        try:
-            rate_limit()
-            user_info = vk_user.users.get(user_ids=[user_id])[0]
-            name = f"{user_info['first_name']} {user_info['last_name']}"
-            text += f"👤 {name} (ID: {user_id}) — {days} дней\n"
-        except:
-            text += f"👤 ID: {user_id} — {days} дней\n"
-    
-    return text
-
-
 # ====================== КОМАНДЫ АДМИНА ======================
 
 def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int) -> bool:
@@ -853,28 +793,39 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
     cleanup_expired_vip()
     
     if text_lower.startswith('!vip '):
-        try:
-            vk_link = extract_vk_link(text.split()[1])
-        except IndexError:
-            send_message(peer_id, "⚠️ Использование: !vip [ссылка]")
+        parts = text.split()
+        if len(parts) < 2:
+            send_message(peer_id, "⚠️ Использование: !vip [ссылка] [24|48|72]\n\nПример: !vip wall-123_456 48\n(срок необязателен, по умолчанию 24 часа)")
             return True
-        
-        if vk_link:
-            with vip_links_lock:
-                for vip in vip_links:
-                    if vip['link'] == vk_link:
-                        send_message(peer_id, f"⚠️ Ссылка уже в VIP!")
-                        return True
-                vip_links.append({
-                    'link': vk_link,
-                    'added_by': user_id,
-                    'expires_at': datetime.now() + timedelta(hours=VIP_DURATION_HOURS)
-                })
-                save_vip_links()
-                reload_vip_links()
-            send_message(peer_id, f"⭐ VIP-ссылка добавлена на 24 часа!\n🔗 {make_clickable_link(vk_link)}")
-        else:
+
+        vk_link = extract_vk_link(parts[1])
+        if not vk_link:
             send_message(peer_id, "⚠️ Не удалось распознать ссылку!")
+            return True
+
+        # Срок: второй аргумент, если есть; иначе — по умолчанию
+        duration_hours = DEFAULT_VIP_DURATION
+        if len(parts) >= 3:
+            duration_arg = parts[2].strip()
+            if duration_arg in VIP_DURATIONS:
+                duration_hours = VIP_DURATIONS[duration_arg]
+            else:
+                send_message(peer_id, f"⚠️ Неверный срок: {duration_arg}\nДоступные варианты: 24, 48, 72")
+                return True
+
+        with vip_links_lock:
+            for vip in vip_links:
+                if vip['link'] == vk_link:
+                    send_message(peer_id, f"⚠️ Ссылка уже в VIP!")
+                    return True
+            vip_links.append({
+                'link': vk_link,
+                'added_by': user_id,
+                'expires_at': datetime.now() + timedelta(hours=duration_hours)
+            })
+            save_vip_links()
+            reload_vip_links()
+        send_message(peer_id, f"⭐ VIP-ссылка добавлена на {duration_hours} ч!\n🔗 {make_clickable_link(vk_link)}")
         return True
     
     if text_lower.startswith('!delvip'):
@@ -910,11 +861,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
                 hours = int(remaining.total_seconds() // 3600)
                 result += f"🔗 {make_clickable_link(vip['link'])}\n⏳ Осталось: {hours}ч\n\n"
             send_message(peer_id, result)
-        return True
-    
-    if text_lower == '!inactive':
-        inactive_text = get_inactive_users(peer_id)
-        send_message(peer_id, inactive_text)
         return True
     
     if text_lower.startswith('!delqueue'):
@@ -1003,7 +949,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
     
     text_lower = text.lower().strip()
     
-    command_prefixes = ['!vip', '!delvip', '!inactive', '!delqueue', '!clearqueue', '!queue_list']
+    command_prefixes = ['!vip', '!delvip', '!delqueue', '!clearqueue', '!queue_list']
     is_command = any(text_lower.startswith(cmd) for cmd in command_prefixes)
     
     if is_command:
@@ -1149,13 +1095,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         if len(queue) > MAX_QUEUE_SIZE:
             queue.pop(0)
         save_queue()
-    
-    with activity_lock:
-        user_activity[user_id] = {
-            'last_post_time': datetime.now(),
-            'post_count': user_activity.get(user_id, {}).get('post_count', 0) + 1
-        }
-    save_user_activity(user_id)
     
     text = f"{mention}, ✅ ваша ссылка опубликована!\n🔗 {make_clickable_link(vk_link)}\n📊 В очереди: {len(queue)}\n\n"
     text += "⏳ Ждем Вас через 5 ссылок!\n\n"
